@@ -10,13 +10,6 @@ import Foundation
 
 /// Initial checkout into an unpublished, empty clone, never a destructive reset.
 enum GitCheckout {
-    private struct IndexEntry {
-        let path: Data
-        let mode: GitFileMode
-        let id: GitObjectID
-        let size: Int
-    }
-
     private struct SymbolicLink {
         let path: URL
         let target: Data
@@ -25,7 +18,7 @@ enum GitCheckout {
     @concurrent
     static func populate(_ repository: GitRepository, commit: GitObjectID?, options: GitCloneOptions,
                          progress: GitCloneProgressHandler?) async throws {
-        var index = [IndexEntry]()
+        var index = [GitIndexEntry]()
         var links = [SymbolicLink]()
         var paths = Set<String>()
         var entryCount = 0
@@ -56,7 +49,7 @@ enum GitCheckout {
                     try await visit(entry.objectID, components: components, depth: depth + 1)
                 case .gitlink:
                     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
-                    index.append(IndexEntry(path: Data(relative.utf8), mode: entry.mode, id: entry.objectID, size: 0))
+                    index.append(GitIndexEntry(path: relative, mode: entry.mode, id: entry.objectID, size: 0))
                 case .regular, .executable, .symbolicLink:
                     let blob = try await repository.readObject(entry.objectID)
                     guard blob.kind == .blob else { throw GitError.malformedObject("tree file is not a blob") }
@@ -67,7 +60,7 @@ enum GitCheckout {
                         try blob.body.write(to: url, options: .withoutOverwriting)
                         try FileManager.default.setAttributes([.posixPermissions: entry.mode == .executable ? 0o755 : 0o644], ofItemAtPath: url.path)
                     }
-                    index.append(IndexEntry(path: Data(relative.utf8), mode: entry.mode, id: entry.objectID, size: blob.body.count))
+                    index.append(GitIndexEntry(path: relative, mode: entry.mode, id: entry.objectID, size: blob.body.count))
                 }
                 if entryCount % 100 == 0 { progress?(.init(stage: .checkingOut, completed: Int64(entryCount))) }
             }
@@ -89,37 +82,10 @@ enum GitCheckout {
             }
             guard status == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         }
-        try writeIndex(index, algorithm: repository.hashAlgorithm, at: root.appendingPathComponent(".git/index"))
+        try GitIndex.encode(index, algorithm: repository.hashAlgorithm).write(to: root.appendingPathComponent(".git/index"), options: .withoutOverwriting)
         progress?(.init(stage: .checkingOut, completed: Int64(entryCount), total: Int64(entryCount)))
     }
 
-    private static func writeIndex(_ entries: [IndexEntry], algorithm: GitHashAlgorithm, at url: URL) throws {
-        var data = Data("DIRC".utf8)
-        data.appendNetwork(2)
-        data.appendNetwork(UInt32(entries.count))
-        for entry in entries.sorted(by: { $0.path.lexicographicallyPrecedes($1.path) }) {
-            try Task.checkCancellation()
-            let start = data.count
-            // Zero stat fields force a safe content refresh by other Git clients.
-            for _ in 0..<6 { data.appendNetwork(0) }
-            guard let mode = UInt32(entry.mode.rawValue, radix: 8) else { throw GitError.malformedObject("index mode") }
-            data.appendNetwork(mode)
-            data.appendNetwork(0) // uid
-            data.appendNetwork(0) // gid
-            data.appendNetwork(UInt32(entry.size))
-            data.append(contentsOf: entry.id.bytes)
-            let length = min(entry.path.count, 0xFFF)
-            data.append(UInt8(length >> 8))
-            data.append(UInt8(length & 255))
-            data.append(entry.path)
-            data.append(0)
-            while (data.count - start) % 8 != 0 { data.append(0) }
-        }
-        var checksum = GitChecksum(algorithm)
-        checksum.update(data)
-        data.append(contentsOf: try checksum.finalize().bytes)
-        try data.write(to: url, options: .withoutOverwriting)
-    }
 }
 
 extension Data {

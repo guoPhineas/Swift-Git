@@ -1,0 +1,91 @@
+//
+//  GitCommit.swift
+//  Swift-Git
+//
+//  Created by Phineas Guo on 2026/10/16.
+//
+
+import Foundation
+
+public struct GitAuthor: Sendable {
+    public let name: String
+    public let email: String
+
+    public init(name: String, email: String) throws {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, email.contains("@"), !email.contains(" "),
+              (name + email).utf8.allSatisfy({ $0 >= 32 && $0 != 127 && $0 != 60 && $0 != 62 }) else {
+            throw GitError.invalidIdentity
+        }
+        self.name = name
+        self.email = email
+    }
+}
+
+extension GitRepository {
+    /// Commits the current index only. Files edited after staging remain unstaged.
+    /// All writes are serialized by Git-compatible lock files; worktree files are untouched.
+    public func commit(message: String, author: GitAuthor, date: Date = .now) throws -> GitObjectID {
+        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !message.utf8.contains(0) else {
+            throw GitError.malformedObject("empty or invalid commit message")
+        }
+        for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] {
+            if FileManager.default.fileExists(atPath: gitDirectory.appendingPathComponent(marker).path) {
+                throw GitError.unsupportedFeature("commit during merge, cherry-pick, revert, or rebase")
+            }
+        }
+        let indexLock = try GitFileLock(metadataURL("index"))
+        let headLock = try GitFileLock(metadataURL("HEAD"))
+        defer { withExtendedLifetime(indexLock) {}; withExtendedLifetime(headLock) {} }
+        let state = try headState()
+        let targetLock: GitFileLock
+        if let reference = state.reference {
+            if let data = try optionalMetadata(reference, limit: 4096), data.starts(with: Data("ref: ".utf8)) {
+                throw GitError.unsupportedFeature("nested symbolic branch update")
+            }
+            targetLock = try GitFileLock(metadataURL(reference, createParents: true))
+        } else { targetLock = headLock }
+        let entries = try indexEntries()
+        let tree = try writeTree(entries, base: "", depth: 0)
+        if let old = state.id, try commitObject(old).tree == tree { throw GitError.nothingToCommit }
+        guard state.id != nil || !entries.isEmpty else { throw GitError.nothingToCommit }
+        let timestamp = date.timeIntervalSince1970
+        guard timestamp.isFinite, timestamp >= 0, timestamp < Double(Int64.max) else {
+            throw GitError.malformedObject("invalid commit date")
+        }
+        let identity = "\(author.name) <\(author.email)> \(Int64(timestamp)) +0000"
+        var body = "tree \(tree.hex)\n"
+        if let parent = state.id { body += "parent \(parent.hex)\n" }
+        body += "author \(identity)\ncommitter \(identity)\n\n" + message
+        if !body.hasSuffix("\n") { body += "\n" }
+        let id = try writeObject(.init(kind: .commit, body: Data(body.utf8)))
+        guard try headState() == state else { throw GitError.repositoryBusy }
+        // This is the publication point. No fallible work follows it.
+        try targetLock.publish(Data("\(id.hex)\n".utf8))
+        return id
+    }
+
+    private func writeTree(_ entries: [GitIndexEntry], base: String, depth: Int) throws -> GitObjectID {
+        guard depth <= 256 else { throw GitError.resourceLimitExceeded("tree depth", 256) }
+        var files = [GitTreeEntry]()
+        var directories = [String: [GitIndexEntry]]()
+        for entry in entries {
+            try Task.checkCancellation()
+            let relative = entry.path.dropFirst(base.count)
+            if let slash = relative.firstIndex(of: "/") {
+                directories[String(relative[..<slash]), default: []].append(entry)
+            } else {
+                if entry.mode != .gitlink {
+                    guard try readObject(entry.id).kind == .blob else { throw GitError.malformedObject("staged file is not a blob") }
+                }
+                files.append(try .init(mode: entry.mode, name: Data(relative.utf8), objectID: entry.id))
+            }
+        }
+        for (name, children) in directories {
+            let id = try writeTree(children, base: base + name + "/", depth: depth + 1)
+            files.append(try .init(mode: .directory, name: Data(name.utf8), objectID: id))
+        }
+        return try writeObject(GitTree(entries: files).object(using: hashAlgorithm))
+    }
+}

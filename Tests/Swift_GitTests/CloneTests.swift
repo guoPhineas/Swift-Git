@@ -206,6 +206,11 @@ func publicHTTPSClone(url: String) async throws {
     let repository = try await GitRepository.clone(from: remote, to: root)
     #expect(repository.initialBranch == "master")
     #expect(try Data(contentsOf: root.appendingPathComponent("README")).count > 0)
+    let reopened = try await GitRepository.open(at: root)
+    #expect(try await reopened.status().files.isEmpty)
+    let actualHistory = try await reopened.log().map { $0.id.hex }
+    let nativeHistory = String(decoding: try nativeGit(["rev-list", "HEAD"], at: root), as: UTF8.self).split(separator: "\n").map(String.init)
+    #expect(Set(actualHistory) == Set(nativeHistory))
     #expect(try nativeGit(["status", "--porcelain"], at: root).isEmpty)
     _ = try nativeGit(["fsck", "--strict"], at: root)
 }
@@ -239,6 +244,10 @@ func cloneInteroperatesWithOfficialUploadPack(algorithm: GitHashAlgorithm) async
     let repository = try await GitRepository.clone(from: remote, to: target, transport: NativeTransport(source: source))
     #expect(repository.hashAlgorithm == algorithm)
     #expect(repository.initialBranch == "main")
+    let reopened = try await GitRepository.open(at: target)
+    #expect(try await reopened.status().files.isEmpty)
+    #expect(try await reopened.log().count == 9)
+    #expect(try await reopened.log(limit: 2).count == 2)
     #expect(try nativeGit(["rev-parse", "HEAD"], at: target) == nativeGit(["rev-parse", "HEAD"], at: source))
     #expect(try nativeGit(["status", "--porcelain"], at: target).isEmpty)
     #expect(try nativeGit(["config", "remote.origin.url"], at: target) == Data("https://example.com/fixture.git\n".utf8))

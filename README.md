@@ -22,6 +22,10 @@ hashing, compression and SHA-1 collision detection. See [third-party notices](TH
 - Initial checkout and index v2 generation, origin tracking refs, tags and branch configuration.
 - Atomic publication into a new destination; cancellation/failure removes the unpublished clone.
 - Tests against official upload-pack, clean native Git status/fsck and opt-in live GitHub clones.
+- Local HEAD/loose and packed-reference resolution, typed commit history across merge parents.
+- HEAD/index/worktree status, ignore rules, staged and unstaged before/after comparisons.
+- Stage and unstage exact file paths, including deletions, with index v2/v3 decoding.
+- Local commits of the index with author identity, tree generation and locked atomic ref updates.
 
 ```swift
 import Foundation
@@ -33,8 +37,17 @@ let id = try await repository.writeObject(object)
 let restored = try await repository.readObject(id)
 ```
 
-Writing a raw commit object does **not** update HEAD, stage files or perform a
-user-facing commit. Those workflows must be implemented with index/ref transactions.
+Writing a raw commit object does **not** update HEAD. Use the index/ref workflow:
+
+```swift
+let status = try await repository.status()
+try await repository.stage(paths: ["README.md"])
+let commit = try await repository.commit(
+    message: "Update README",
+    author: GitAuthor(name: "Phineas Guo", email: "phineas@example.com")
+)
+let history = try await repository.log(limit: 200)
+```
 
 ```swift
 let remote = try GitRemoteURL("https://github.com/octocat/Hello-World.git")
@@ -76,8 +89,8 @@ are rejected before the clone is published. Symlinks are installed last.
 Authentication, SSH, protocol v2, shallow/partial clone and server-side filters are
 not implemented yet. SHA-256 is tested against official upload-pack fixtures;
 actual hosting support depends on the server. Existing packed repositories cannot
-yet be read through readObject. General status/commit/fetch/pull/push workflows,
-attributes conversion and reftable remain pending. Initial checkout preserves raw
+yet be read through readObject. Fetch/pull/push, attributes conversion and reftable
+remain pending. Initial checkout preserves raw
 blob bytes rather than applying executable filters or platform line-ending conversion.
 
 The minimal config parser accepts the plain configuration written here and rejects
@@ -85,12 +98,29 @@ unsupported syntax/features rather than pretending full Git config compatibility
 The nonthrowing GitObject.id(using:) is a raw format hash; persisted and incoming
 objects use the throwing collision-checked checksum path.
 
+Clones retain their local `.git` directory, loose objects, refs, HEAD, config and
+index. Removing the temporary transfer pack does not remove its unpacked objects
+or history. Status, staging, commits and history reopen this on-disk data; they do
+not use an in-memory imitation of a repository.
+
+Status hashes saved bytes, includes executable and symlink changes, and applies
+hierarchical `.gitignore` plus `.git/info/exclude` (including negation, directory
+rules and globstar). Global excludes and attributes/clean filters are not applied.
+Worktree scans are capped at 100,000 entries and 512 MiB of content, each file at
+the repository's object limit. Ignored untracked files are not force-added.
+Uninitialized gitlinks are preserved; initialized submodule status is unsupported.
+Index v4, conflicted/extended/split/sparse indexes and mandatory extensions fail
+explicitly. Local commits do not run hooks, sign commits, write reflogs, or finish
+merge/rebase/cherry-pick operations. Existing lock files are respected, not removed.
+History pages walk all HEAD parents, load up to 10,000 commits, and bound retained
+presentation data to 32 MiB. Branch selection and a graphical DAG remain future work.
+
 ## Implementation order
 
 1. **Implemented:** hashes, byte parsing, raw objects, trees and loose storage.
 2. **Implemented clone slice:** pack/delta decoding, HTTPS v0/v1, initial index/refs/checkout.
-3. **Next:** general index/ref transactions, status, ignore/attributes, typed commits,
-   history and safe branch switching.
+3. **Implemented local workflow:** status, ignores, staging, local commits and HEAD history.
+   **Next:** attributes, reflogs, broader index support and safe branch switching.
 4. Permanent pack/index storage, reftable transactions, protocol v2 and incremental fetch.
 5. Depth/deepen/unshallow, blob:none and blob:limit promisor fetch.
 6. Diff, merge bases, conflict resolution, pull and push.

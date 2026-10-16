@@ -25,11 +25,17 @@ public enum GitError: Error, Sendable, Equatable {
     case invalidProtocol(String)
     case sha1Collision
     case unsafeCheckoutPath(String)
+    case repositoryBusy
+    case nothingToCommit
+    case invalidIdentity
 }
 
 extension GitError: LocalizedError {
     public var errorDescription: String? {
         switch self {
+        case .repositoryBusy: "Another Git operation is in progress. Wait for it to finish and retry."
+        case .nothingToCommit: "There are no staged changes to commit."
+        case .invalidIdentity: "Enter a valid author name and email address."
         case .invalidObjectID: "Invalid Git object ID."
         case .malformedObject(let reason): "Invalid Git object: \(reason)"
         case .truncatedInput: "Git data ended unexpectedly."

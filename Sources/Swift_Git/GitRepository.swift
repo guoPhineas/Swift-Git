@@ -14,8 +14,8 @@ public actor GitRepository {
     public nonisolated let workingDirectory: URL
     public nonisolated let hashAlgorithm: GitHashAlgorithm
     public nonisolated let initialBranch: String?
-    private let gitDirectory: URL
-    private let maximumObjectBytes: Int
+    let gitDirectory: URL
+    let maximumObjectBytes: Int
 
     init(directory: URL, algorithm: GitHashAlgorithm, branch: String?, limit: Int) {
         workingDirectory = directory
@@ -148,13 +148,13 @@ public actor GitRepository {
         guard limit >= 0, limit <= Int(UInt32.max) - 65_536 else { throw GitError.sizeLimitExceeded(limit) }
     }
 
-    private static func requireDirectory(_ url: URL) throws {
+    static func requireDirectory(_ url: URL) throws {
         let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true else { throw GitError.notRepository }
     }
 
     /// Open without following a final symlink; bound allocation before reading.
-    private static func readFile(_ url: URL, limit: Int) throws -> Data {
+    static func readFile(_ url: URL, limit: Int) throws -> Data {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
         guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)

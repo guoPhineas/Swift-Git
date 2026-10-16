@@ -1,0 +1,12 @@
+//
+//  module.modulemap
+//  Swift-Git
+//
+//  Created by Phineas Guo on 2026/10/16.
+//
+
+module CZlib [system] {
+    header "include/shim.h"
+    link "z"
+    export *
+}

@@ -3,9 +3,10 @@
 A Swift implementation of Git storage and operations for iOS 26+ and macOS 26+.
 The implementation is written independently from Git's format specifications.
 There is no libgit2 dependency and no Git process execution in the library.
-CryptoKit and system zlib provide hashing and compression.
+CryptoKit, system zlib and the independently MIT-licensed SHA1DC primitive provide
+hashing, compression and SHA-1 collision detection. See [third-party notices](THIRD_PARTY.md).
 
-## Implemented foundation
+## Implemented capabilities
 
 - Swift 6 language mode and checked Sendable/actor isolation.
 - SHA-1 and SHA-256 object IDs; binary-safe raw blob/tree/commit/tag objects.
@@ -15,6 +16,12 @@ CryptoKit and system zlib provide hashing and compression.
 - Actor-isolated loose-object reads/writes with exclusive object publication.
 - Swift Testing tests including bidirectional interchange with Apple Git 2.54.0.
 - A deterministic Release hashing microbenchmark.
+- Public HTTPS full clone using Git Smart HTTP protocol v0/v1.
+- Disk-backed pack transfer, pack v2/v3 parsing, OFS_DELTA and forward REF_DELTA resolution.
+- SHA1DC validation of incoming SHA-1 pack/object data and reference type/connectivity checks.
+- Initial checkout and index v2 generation, origin tracking refs, tags and branch configuration.
+- Atomic publication into a new destination; cancellation/failure removes the unpublished clone.
+- Tests against official upload-pack, clean native Git status/fsck and opt-in live GitHub clones.
 
 ```swift
 import Foundation
@@ -29,6 +36,15 @@ let restored = try await repository.readObject(id)
 Writing a raw commit object does **not** update HEAD, stage files or perform a
 user-facing commit. Those workflows must be implemented with index/ref transactions.
 
+```swift
+let remote = try GitRemoteURL("https://github.com/octocat/Hello-World.git")
+let cloned = try await GitRepository.clone(from: remote, to: newWorkspaceURL) { progress in
+    // Send progress to your UI actor; this callback can run off the main actor.
+}
+```
+
+The clone destination must not exist. An existing destination is never replaced.
+
 ## Validation
 
 Requires Xcode 27.1 / Swift 6.4 or newer. From this directory:
@@ -37,6 +53,7 @@ Requires Xcode 27.1 / Swift 6.4 or newer. From this directory:
 swift test
 swift test -c release
 swift run -c release swift-git-benchmark
+SWIFT_GIT_NETWORK_TESTS=1 swift test --filter publicHTTPSClone
 ```
 
 The official Git executable is used only by macOS integration tests. Tests isolate
@@ -44,27 +61,40 @@ Git configuration and generate temporary repositories; they do not copy Git test
 
 ## Current limits
 
-This is a development foundation, not yet a general-purpose Git client. Objects
-are buffered with a configurable 64 MiB default safety limit; large-object streaming
-and pack support are pending. `readObject` accesses loose objects only; a missing
-object may be packed and is not automatically considered repository corruption.
+This is still a development Git client. Clone downloads to disk and unpacks objects
+into the loose object store; it does not retain a permanent pack/index. Individual
+objects are buffered with a 64 MiB default limit. Default clone budgets are 128 MiB
+of HTTP response data, 512 MiB of expanded objects, 250,000 pack entries and 100,000
+checkout entries. Limits are configurable through GitCloneOptions and fail explicitly.
+Delta chains are bounded to 128 levels and directory nesting to 256.
+
+Checkout preserves regular/executable files and symlinks. Gitlinks are recorded in
+the index and created as empty directories; submodule contents are not downloaded.
+Unsafe .git paths, case/normalization collisions and unsupported checkout filenames
+are rejected before the clone is published. Symlinks are installed last.
+
+Authentication, SSH, protocol v2, shallow/partial clone and server-side filters are
+not implemented yet. SHA-256 is tested against official upload-pack fixtures;
+actual hosting support depends on the server. Existing packed repositories cannot
+yet be read through readObject. General status/commit/fetch/pull/push workflows,
+attributes conversion and reftable remain pending. Initial checkout preserves raw
+blob bytes rather than applying executable filters or platform line-ending conversion.
+
 The minimal config parser accepts the plain configuration written here and rejects
 unsupported syntax/features rather than pretending full Git config compatibility.
-
-CryptoKit SHA-1 is format-compatible hashing, **not SHA1DC collision detection**.
-Untrusted remote repository support is not ready for release until collision defense,
-hostile-input testing and protocol validation are complete.
+The nonthrowing GitObject.id(using:) is a raw format hash; persisted and incoming
+objects use the throwing collision-checked checksum path.
 
 ## Implementation order
 
-1. **Foundation (implemented):** hashes, byte parsing, raw objects, trees, loose store.
-2. **Local workflows:** index, transactional refs/reflog, status, ignore/attributes,
-   typed commits, history and safe checkout.
-3. **Packed storage:** pack/delta/index readers and writers; reftable transactions.
-4. **Remote reads:** HTTPS Smart HTTP, protocol v2 with v0/v1 compatibility.
-5. **Extended clone:** depth/deepen/unshallow, blob:none and blob:limit promisor fetch.
-6. **Integration:** diff, merge bases, conflict resolution, pull and push.
-7. **Hardening:** interoperability matrix, fuzzing, interruption recovery and mobile benchmarks.
+1. **Implemented:** hashes, byte parsing, raw objects, trees and loose storage.
+2. **Implemented clone slice:** pack/delta decoding, HTTPS v0/v1, initial index/refs/checkout.
+3. **Next:** general index/ref transactions, status, ignore/attributes, typed commits,
+   history and safe branch switching.
+4. Permanent pack/index storage, reftable transactions, protocol v2 and incremental fetch.
+5. Depth/deepen/unshallow, blob:none and blob:limit promisor fetch.
+6. Diff, merge bases, conflict resolution, pull and push.
+7. Broader fuzzing, crash-recovery testing and mobile performance baselines.
 
 All release requirements include SHA-1/SHA-256 and files/reftable combinations.
 SHA-256 conversion, arbitrary partial-clone filters, SSH, LFS, sparse/split index,

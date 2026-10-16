@@ -47,11 +47,13 @@ public struct GitTree: Sendable, Equatable {
         self.entries = entries.sorted { $0.sortKey.lexicographicallyPrecedes($1.sortKey) }
     }
 
-    public init(object: GitObject, algorithm: GitHashAlgorithm) throws {
+    public init(object: GitObject, algorithm: GitHashAlgorithm, maximumEntries: Int = 100_000) throws {
         guard object.kind == .tree else { throw GitError.malformedObject("expected tree") }
         var reader = GitByteReader(object.body)
         var entries = [GitTreeEntry]()
         while !reader.isAtEnd {
+            try Task.checkCancellation()
+            guard entries.count < maximumEntries else { throw GitError.resourceLimitExceeded("tree entry count", maximumEntries) }
             let modeBytes = try reader.read(until: 32)
             guard let mode = GitFileMode(rawValue: String(decoding: modeBytes, as: UTF8.self)) else {
                 throw GitError.malformedObject("invalid tree mode")

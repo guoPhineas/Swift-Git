@@ -9,6 +9,47 @@ import CZlib
 import Foundation
 
 enum GitZlib {
+    /// Consumes exactly one zlib member, retaining the following pack entry in the reader.
+    static func decompress(from reader: GitFileReader, expectedSize: Int, limit: Int) throws -> Data {
+        guard expectedSize >= 0, expectedSize <= limit else { throw GitError.sizeLimitExceeded(limit) }
+        var stream = z_stream()
+        let status = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+        guard status == Z_OK else { throw GitError.compression(status) }
+        defer { inflateEnd(&stream) }
+        var output = Data()
+        var chunk = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            try Task.checkCancellation()
+            let input = try reader.peek()
+            guard !input.isEmpty else { throw GitError.truncatedInput }
+            let result: (status: Int32, consumed: Int) = try input.withUnsafeBytes { source in
+                stream.next_in = UnsafeMutablePointer(mutating: source.bindMemory(to: Bytef.self).baseAddress)
+                stream.avail_in = uInt(source.count)
+                defer { stream.next_in = nil; stream.next_out = nil }
+                var status: Int32 = Z_OK
+                repeat {
+                    try Task.checkCancellation()
+                    let written = chunk.withUnsafeMutableBytes { destination in
+                        stream.next_out = destination.bindMemory(to: Bytef.self).baseAddress
+                        stream.avail_out = uInt(destination.count)
+                        status = inflate(&stream, Z_NO_FLUSH)
+                        stream.next_out = nil
+                        return destination.count - Int(stream.avail_out)
+                    }
+                    guard written <= expectedSize - output.count else { throw GitError.malformedObject("inflated size exceeds pack header") }
+                    output.append(contentsOf: chunk.prefix(written))
+                } while status == Z_OK && stream.avail_in > 0
+                return (status, source.count - Int(stream.avail_in))
+            }
+            try reader.advance(result.consumed)
+            if result.status == Z_STREAM_END {
+                guard output.count == expectedSize else { throw GitError.malformedObject("inflated size differs from pack header") }
+                return output
+            }
+            guard result.status == Z_OK, result.consumed > 0 else { throw GitError.compression(result.status) }
+        }
+    }
+
     static func compress(_ input: Data) throws -> Data {
         guard input.count <= Int(UInt32.max) else { throw GitError.sizeLimitExceeded(Int(UInt32.max)) }
         var length = compressBound(uLong(input.count))

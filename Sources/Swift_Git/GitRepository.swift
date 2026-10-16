@@ -17,7 +17,7 @@ public actor GitRepository {
     private let gitDirectory: URL
     private let maximumObjectBytes: Int
 
-    private init(directory: URL, algorithm: GitHashAlgorithm, branch: String?, limit: Int) {
+    init(directory: URL, algorithm: GitHashAlgorithm, branch: String?, limit: Int) {
         workingDirectory = directory
         gitDirectory = directory.appendingPathComponent(".git", isDirectory: true)
         hashAlgorithm = algorithm
@@ -94,7 +94,7 @@ public actor GitRepository {
     public func writeObject(_ object: GitObject) throws -> GitObjectID {
         guard object.body.count <= maximumObjectBytes else { throw GitError.sizeLimitExceeded(maximumObjectBytes) }
         try Task.checkCancellation()
-        let id = object.id(using: hashAlgorithm)
+        let id = try object.validatedID(using: hashAlgorithm)
         let destination = objectURL(id)
         try Self.requireDirectory(gitDirectory)
         try Self.requireDirectory(gitDirectory.appendingPathComponent("objects"))
@@ -134,7 +134,7 @@ public actor GitRepository {
         }
         let object = try GitObject(encoded: GitZlib.decompress(compressed, limit: maximumObjectBytes + 128))
         guard object.body.count <= maximumObjectBytes else { throw GitError.sizeLimitExceeded(maximumObjectBytes) }
-        guard object.id(using: hashAlgorithm) == id else { throw GitError.objectHashMismatch }
+        guard try object.validatedID(using: hashAlgorithm) == id else { throw GitError.objectHashMismatch }
         return object
     }
 

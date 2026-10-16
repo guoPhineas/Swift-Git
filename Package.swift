@@ -17,9 +17,10 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "CZlib"),
-        .target(name: "Swift_Git", dependencies: ["CZlib"]),
+        .target(name: "CSHA1DC", exclude: ["LICENSE.txt"]),
+        .target(name: "Swift_Git", dependencies: ["CZlib", "CSHA1DC"], resources: [.copy("Resources/SHA1DC-LICENSE.txt")]),
         .executableTarget(name: "SwiftGitBenchmark", dependencies: ["Swift_Git"]),
-        .testTarget(name: "Swift_GitTests", dependencies: ["Swift_Git"]),
+        .testTarget(name: "Swift_GitTests", dependencies: ["Swift_Git"], resources: [.copy("Fixtures")]),
     ],
     swiftLanguageModes: [.v6]
 )

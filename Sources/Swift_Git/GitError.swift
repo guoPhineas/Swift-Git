@@ -19,6 +19,12 @@ public enum GitError: Error, Sendable, Equatable {
     case notRepository
     case repositoryAlreadyExists
     case unsupportedFeature(String)
+    case invalidRemoteURL
+    case resourceLimitExceeded(String, Int)
+    case httpStatus(Int)
+    case invalidProtocol(String)
+    case sha1Collision
+    case unsafeCheckoutPath(String)
 }
 
 extension GitError: LocalizedError {
@@ -35,6 +41,12 @@ extension GitError: LocalizedError {
         case .notRepository: "The directory is not a supported Git repository."
         case .repositoryAlreadyExists: "The repository destination is not empty."
         case .unsupportedFeature(let feature): "Not supported yet: \(feature)."
+        case .resourceLimitExceeded(let resource, let limit): "The repository exceeds the \(resource) limit (\(limit))."
+        case .invalidRemoteURL: "Enter a public HTTPS repository URL without credentials, a query, or a fragment."
+        case .httpStatus(let status): "The Git server returned HTTP \(status). The repository may be unavailable or require authentication."
+        case .invalidProtocol(let reason): "Invalid Git server response: \(reason)"
+        case .sha1Collision: "A SHA-1 collision was detected. The repository was rejected."
+        case .unsafeCheckoutPath(let path): "The repository contains a path that cannot be safely checked out: \(path)"
         }
     }
 }

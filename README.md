@@ -1,171 +1,185 @@
 # Swift-Git
 
-An independent Swift Git engine for iOS 26+ and macOS 26+, built from Git's public
-format/protocol specifications. The library does not execute Git, use libgit2, or
-translate/copy Git's GPL implementation. CryptoKit, system zlib and the independently
-MIT-licensed SHA1DC primitive provide hashing, compression and collision detection.
-See [third-party notices](THIRD_PARTY.md).
+Swift-Git is a reusable Git framework for iOS and macOS. It provides asynchronous Swift APIs for repository storage, HTTPS synchronization, commits, branches, history and merge workflows.
 
-## Implemented capabilities
+The repository engine implements Git object formats and network protocols directly. It uses CryptoKit, system zlib and SHA1DC for hashing, compression and SHA-1 collision detection, without requiring an installed Git executable or libgit2 at runtime.
 
-- Swift 6 actor isolation and Sendable APIs; binary-safe SHA-1/SHA-256 objects.
-- Loose-object read/write, validated trees/commits/tags, packed refs, permanent pack
-  files and pack index v1/v2 reads with object/hash validation.
-- Smart HTTPS full-history clone over protocol v0/v1/v2, `ls-refs`, incremental fetch
-  negotiation, origin tracking refs, tags, FETCH_HEAD and initial branch configuration.
-- Pack v2/v3 decoding, OFS_DELTA/REF_DELTA, bounded delta expansion, canonical pack
-  index v2 writing with CRCs, and retained packs after clone/fetch.
-- Optional HTTPS credentials supplied in memory; credentials are excluded from Git
-  config/remote URLs. Ephemeral HTTP sessions reject cross-origin redirects.
-- Push with receive-pack report-status, bounded outgoing packs, server compare-and-swap
-  ref updates and rejection of non-fast-forward branch updates.
-- Saved-byte status for HEAD/index/worktree, hierarchical ignore rules, executable
-  and symbolic link changes, exact-path stage/unstage and before/after comparisons.
-- Index v2/v3, including standard merge conflict stages 1/2/3.
-- Commit author/committer data, index tree generation, locked ref updates and reflogs.
-- Commit preparation with an opaque review snapshot; optional expected-state checks
-  reject index, branch or pending-merge changes while allowing unstaged file edits.
-- Branch listing/create/switch, tracking configuration, detached checkout, safe
-  deletion of merged branches and lightweight tag creation.
-- Fast-forward and bounded three-way merge, merge-base lookup, text conflict markers,
-  binary/add/delete conflicts, choose-side or edit-and-stage resolution, merge commit
-  continuation, and abort of merges started by this library.
-- Pull as fetch plus merge, protecting against a branch/HEAD change while fetching.
-- Recoverable worktree/index/ref transactions, rollback, persistent journals and
-  reopening recovery for interrupted operations. Existing unrelated locks are respected.
-- Typed history across all merge parents, topological ordering, commit changed-file
-  lists and file comparison against a selected parent.
+## Capabilities
+
+| Area | Supported functionality |
+| --- | --- |
+| Objects | SHA-1/SHA-256 IDs; blobs, trees, commits and tags; loose and packed storage |
+| Pack files | Pack v2/v3, OFS_DELTA/REF_DELTA, pack index v1/v2 reads and v2 writing |
+| Transport | Smart HTTPS protocol v0/v1/v2, full-history clone, incremental fetch and branch push |
+| Local changes | HEAD/index/worktree status, ignore rules, stage/unstage and file comparisons |
+| Commits | Author metadata, tree creation, reflogs, merge parents and review-state validation |
+| References | Loose/packed refs, local/remote branches, upstream configuration and lightweight tags |
+| Checkout | Branch switching and detached checkout with worktree protection |
+| Merge | Merge-base lookup, fast-forward/three-way merge, conflict resolution, continuation and abort |
+| History | Topologically ordered commit history, changed-file lists and comparisons against selected parents |
+| Transactions | Git-compatible locks, mutation journals, rollback and interrupted-operation recovery |
+
+`GitRepository` is an actor. Repository operations expose `async`/`throws` call sites and use `Sendable` values for results and progress reporting.
+
+## Requirements
+
+- Swift 6.4 and Swift 6 language mode
+- iOS 18 or macOS 15 and later
+- Xcode 27.1 for Apple-platform development
+
+## Package integration
+
+The library product is named `Swift-Git`; its Swift module is `Swift_Git`. For a local checkout, add the package and product to the consuming manifest:
+
+```swift
+dependencies: [
+    .package(path: "../Swift-Git")
+],
+targets: [
+    .target(
+        name: "YourApp",
+        dependencies: [.product(name: "Swift-Git", package: "Swift-Git")]
+    )
+]
+```
+
+```swift
+import Swift_Git
+```
+
+## Local repository workflow
+
+Create a repository, write a working file, stage it and create a commit:
 
 ```swift
 import Foundation
 import Swift_Git
 
-let remote = try GitRemoteURL("https://github.com/octocat/Hello-World.git")
-let repository = try await GitRepository.clone(from: remote, to: newWorkspaceURL)
-let status = try await repository.status()
+let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+let repository = try await GitRepository.create(at: directory)
+
+try Data("# Example\n".utf8)
+    .write(to: directory.appendingPathComponent("README.md"))
 try await repository.stage(paths: ["README.md"])
-let commit = try await repository.commit(
-    message: "Update README",
-    author: GitAuthor(name: "Phineas Guo", email: "phineas@example.com")
-)
+
+let author = try GitAuthor(name: "Example Developer", email: "dev@example.com")
+let id = try await repository.commit(message: "Initial commit", author: author)
 let history = try await repository.log(limit: 200)
-let changes = try await repository.changes(in: commit)
+let changes = try await repository.changes(in: id)
 ```
 
-For a reviewable commit UI, use a snapshot rather than committing an unseen index:
+Use `GitRepository.open(at:)` to reopen an existing working repository. New repositories default to SHA-1; pass `algorithm: .sha256` to create a SHA-256 repository. `readObject` and `writeObject` provide access to raw Git storage.
+
+### Commit review
+
+A commit UI can capture the state being reviewed and require that state when committing:
 
 ```swift
 let review = try await repository.prepareCommit()
-// Show review.status and review.suggestedMessage to the user.
-let reviewedCommit = try await repository.commit(
-    message: message,
+// Present review.status and review.suggestedMessage in the interface.
+let id = try await repository.commit(
+    message: "Update documentation",
     author: author,
     expectedState: review.state
 )
-// GitError.commitStateChanged requires refreshing and reviewing again.
 ```
 
-Authenticated network operations accept a caller-provided credential:
+Changes to the branch, index or pending merge cause `GitError.commitStateChanged`. The caller can refresh the review before retrying. Commits include the index only; working-file edits made after staging remain unstaged.
+
+## Remote repositories
+
+```swift
+let remote = try GitRemoteURL("https://github.com/octocat/Hello-World.git")
+let repository = try await GitRepository.clone(from: remote, to: destinationURL)
+let fetched = try await repository.fetch()
+```
+
+The clone destination must not exist. Clone retains the repository's local `.git` data and permanent pack/index files. Fetch updates remote-tracking refs and `FETCH_HEAD` without changing working files.
+
+Authenticated operations accept credentials separately from the remote URL:
 
 ```swift
 var options = GitCloneOptions()
 options.credential = try GitHTTPCredential(password: accessToken)
+
 let fetched = try await repository.fetch(options: options)
-let result = try await repository.pull(options: options)
-// A non-fast-forward pull can require resolution and an explicit merge commit.
+let merged = try await repository.pull(options: options)
 let pushed = try await repository.push(credential: options.credential)
 ```
 
-The clone destination must not exist; a failed/cancelled unpublished clone is removed.
-Fetch updates remote-tracking refs without changing the current worktree. Branch
-switches/merges require a clean worktree and protect unrelated untracked/ignored files.
-Push never forces a branch update. Fetch publishes each validated ref under its lock;
-it is not a single atomic update of every advertised ref.
+The caller supplies and stores credentials. Remote URLs must use HTTPS and exclude embedded credentials, queries and fragments. Network sessions are ephemeral and reject cross-origin redirects. Push checks remote ancestry and does not force branch updates. Fetch publishes validated references individually under their locks.
 
-`GitRepository.create`, `open`, `readObject` and `writeObject` also expose raw storage
-for reusable framework clients. Writing a raw commit object alone does not move HEAD.
+### Branches and merges
 
-## Build and tests
+```swift
+try await repository.createBranch("feature")
+try await repository.switchBranch("feature")
+let branches = try await repository.branches()
+```
 
-Requires Xcode 27.1 / Swift 6.4 or newer.
+Branch switches and merges require a clean worktree. Checkout protects unrelated untracked and ignored files. `setUpstream` configures tracking; `checkoutDetached` opens a commit without selecting a branch.
+
+`merge` and `pull` return `GitMergeResult`: up to date, fast-forward, ready to commit, or conflicts. Non-fast-forward merges remain pending until the caller creates the merge commit. Conflicts can be resolved by selecting a side or editing the working file and staging it. `abortMerge` restores the pre-merge state for merges started by Swift-Git. Pending conflicts survive repository reopening.
+
+## Resource limits
+
+Default clone/fetch limits are configurable through `GitCloneOptions`:
+
+| Resource | Default limit |
+| --- | --- |
+| Network response | 128 MiB |
+| Individual object | 64 MiB |
+| Expanded pack contents | 512 MiB |
+| Objects in a received pack | 250,000 |
+| Checkout entries | 100,000 |
+| Delta chain depth | 128 |
+
+Worktree scans are bounded to 100,000 entries and 512 MiB of content. Three-way text merge supports up to 2 MiB and 6,000 total input lines. History returns up to 10,000 commits per request and bounds retained presentation data at 32 MiB.
+
+Packed storage verifies checksums, caches a small number of indexes and reads objects on demand. Existing pack indexes are limited to 250,000 entries and 16 MiB; pack files are limited to `UInt32.max` bytes. Push writes full objects with 128 MiB output and 512 MiB expanded-content limits.
+
+## Compatibility
+
+Swift-Git supports files-based refs and full-history HTTPS repositories. Unsupported mandatory repository features return explicit errors.
+
+The following functionality is not implemented:
+
+- SSH, Git LFS, reftable and shallow/partial/promisor clones.
+- Rebase, cherry-pick/revert, stash and commit signing.
+- Linked worktrees, submodule management and repository maintenance commands.
+- Index v4, extended/sparse/split indexes and initialized-submodule status.
+- Executable hooks, attributes filters, line-ending conversion and global ignore files.
+- Automatic rename/directory conflict resolution, unrelated-history merges and recursive multiple merge bases.
+- The complete Git configuration language, includes, arbitrary refspecs and URL rewriting.
+
+Checkout preserves raw blob bytes, executable modes and symbolic links. Gitlinks are recorded in the index and represented by empty directories. Case/normalization collisions, unsafe metadata paths and unsupported filenames are rejected.
+
+Journal recovery removes only matching locks owned by an exited transaction process. External changes, storage-provider failures or a crash before journal creation can require manual inspection. Once a journaled mutation starts, it completes or rolls back before honoring further cancellation. SHA-256 hosting support depends on the server.
+
+## Build, tests and benchmarks
 
 ```sh
+swift build
 swift test
 swift test -c release
+```
+
+The macOS integration tests use native Git as a fixture server and interoperability oracle. They cover SHA-1/SHA-256, upload-pack/receive-pack, protocol negotiation, packed storage, status, commits, tracking, checkout, merge conflicts and transaction recovery. Native Git is used by tests only.
+
+Enable public GitHub clone tests with:
+
+```sh
 SWIFT_GIT_NETWORK_TESTS=1 swift test -c release
+```
+
+Run the deterministic object-hashing benchmark with:
+
+```sh
 swift run -c release swift-git-benchmark
 ```
 
-macOS integration tests use the official Git executable only as an independent
-fixture server/oracle. The production library never runs it. Temporary repositories
-isolate user Git configuration. Tests cover SHA-1/SHA-256, real upload-pack/receive-pack
-exchanges, v2 with and without the HTTP service preamble, empty repos, fetch/push,
-non-fast-forward rejection, packed storage after native gc, tracking configuration,
-checkout protection, conflict continuation/abort, journal recovery and historical
-diffs. Native status/fsck check interoperability. Opt-in tests clone a real public
-GitHub repository with and without a `.git` URL suffix.
-
-## Limits and unsupported features
-
-This is a development Git client, not a drop-in implementation of every Git command.
-The current scope is full-history HTTPS repositories with files refs. Reftable,
-SSH/LFS and shallow/partial/promisor clones are deferred by the project decision.
-Rebase, cherry-pick/revert, stash, commit signing, linked worktrees, submodule
-management and repository maintenance commands are not implemented.
-
-Clone/fetch default budgets are 128 MiB HTTP data, 512 MiB expanded objects, 64 MiB
-per object, 250,000 pack objects, 100,000 checkout files, 128 delta levels and 256
-directory levels. Clone budgets are configurable through GitCloneOptions. Push uses
-128 MiB output/512 MiB expanded budgets and writes full objects, without outgoing
-delta optimization. Existing pack index reads are capped at 250,000 objects and
-16 MiB index data; pack files at UInt32.max bytes, individual objects at the repository
-limit. Packs are checksum-verified on cache load, then selected objects are read on
-demand. Changing the pack invalidates the small index cache.
-
-Checkout preserves raw regular/executable/symlink blob data; it does not run hooks,
-attributes filters or line-ending conversion. Gitlinks are recorded in the index and
-created as empty directories. Unsafe `.git` paths, case/normalization collisions and
-unsupported filenames are rejected. Initialized submodule status is unsupported.
-
-Status applies hierarchical `.gitignore` and `.git/info/exclude`, including negation,
-directory patterns and globstar. Global excludes and attributes are not applied.
-Scans are capped at 100,000 entries/512 MiB content. Ignored untracked files are not
-force-added. Index v4, extended/split/sparse indexes and mandatory extensions fail
-explicitly. The conservative config parser supports quoted values/subsections, but
-not the complete Git config language, includes, arbitrary refspecs or URL rewriting.
-
-Three-way text merge is bounded to 2 MiB and 6,000 total input lines; larger/binary
-conflicts can be resolved by selecting a side or editing externally. Automatic rename
-and complex directory conflict resolution, unrelated histories and recursive multiple
-merge bases are unsupported. Non-fast-forward clean merges remain pending until the
-caller creates a merge commit. Reopening preserves pending conflicts.
-
-Transaction journals retain before/after data and known lock identities. Recovery
-only removes matching journal-owned locks after confirming the owning process is
-gone; it never blindly clears another client's locks. Filesystem/provider failures
-can still require recovery, and a crash before a journal exists may leave a normal
-Git lock requiring inspection. This is not a guarantee against every power-loss or
-concurrent external writer scenario. Cancellation stops before mutation or transfer;
-once a journaled mutation starts, completion/rollback finishes without cancellation.
-
-History walks HEAD ancestors, presents at most 10,000 commits and bounds retained
-presentation data at 32 MiB. SHA-256 support is tested against native Git; remote host
-support depends on the server. The nonthrowing `GitObject.id(using:)` is a raw format
-hash; persisted/incoming objects use the collision-checked checksum path.
-
-## Performance and next validation
-
-Object hashing feeds header/body separately, parsers use Data slices, transfers use
-temporary files, and permanent pack/index storage avoids retaining a loose copy of
-every cloned object. Packed reads cache a small number of verified indexes; history
-uses a priority heap and topological ordering. These are implementation choices,
-not evidence of being faster than C Git.
-
-The benchmark reports deterministic 1 MiB hashing. Release work still needs broader
-fuzzing, real-device memory/latency measurements, large-repository workloads,
-File Provider failure tests and power-loss/crash matrices before production claims.
-
-## References
+## Git format references
 
 - [Repository layout](https://git-scm.com/docs/gitrepository-layout)
 - [Pack format](https://git-scm.com/docs/gitformat-pack)
@@ -174,6 +188,6 @@ File Provider failure tests and power-loss/crash matrices before production clai
 - [Pack protocol](https://git-scm.com/docs/gitprotocol-pack)
 - [Protocol v2](https://git-scm.com/docs/gitprotocol-v2)
 
-Original code remains under this repository's MIT license. Preserve the separate
-SHA1DC notices. Reusing third-party source requires its own license review; a change
-of implementation language does not remove the original source's obligations.
+## License
+
+Swift-Git is available under the [MIT License](LICENSE). SHA1DC is separately MIT-licensed; its attribution and bundled license are documented in [THIRD_PARTY.md](THIRD_PARTY.md).

@@ -16,6 +16,8 @@ public actor GitRepository {
     public nonisolated let initialBranch: String?
     let gitDirectory: URL
     let maximumObjectBytes: Int
+    var ignoresTransactionCancellation = false
+    var packedIndexes: [URL: GitCachedPack] = [:]
 
     init(directory: URL, algorithm: GitHashAlgorithm, branch: String?, limit: Int) {
         workingDirectory = directory
@@ -87,7 +89,9 @@ public actor GitRepository {
             branch = nil
         }
         try requireDirectory(git.appendingPathComponent("objects", isDirectory: true))
-        return GitRepository(directory: directory, algorithm: algorithm, branch: branch, limit: maximumObjectBytes)
+        let repository = GitRepository(directory: directory, algorithm: algorithm, branch: branch, limit: maximumObjectBytes)
+        try await repository.recoverTransactionIfNeeded()
+        return repository
     }
 
     /// Writes one bounded loose object. Large-object streaming is a later capability.
@@ -116,23 +120,29 @@ public actor GitRepository {
     }
 
     public func readObject(_ id: GitObjectID) throws -> GitObject {
+        try readStoredObject(id, depth: 0, ancestors: [])
+    }
+
+    func readStoredObject(_ id: GitObjectID, depth: Int, ancestors: Set<GitObjectID>) throws -> GitObject {
         guard id.algorithm == hashAlgorithm else { throw GitError.invalidObjectID }
-        try Task.checkCancellation()
+        if !ignoresTransactionCancellation { try Task.checkCancellation() }
         try Self.requireDirectory(gitDirectory)
         try Self.requireDirectory(gitDirectory.appendingPathComponent("objects"))
         let url = objectURL(id)
         do {
             try Self.requireDirectory(url.deletingLastPathComponent())
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            if let object = try readPackedObject(id, depth: depth, ancestors: ancestors) { return object }
             throw GitError.objectNotFound(id)
         }
         let compressed: Data
         do {
             compressed = try Self.readFile(url, limit: maximumObjectBytes + 65_536)
         } catch let error as POSIXError where error.code == .ENOENT {
+            if let object = try readPackedObject(id, depth: depth, ancestors: ancestors) { return object }
             throw GitError.objectNotFound(id)
         }
-        let object = try GitObject(encoded: GitZlib.decompress(compressed, limit: maximumObjectBytes + 128))
+        let object = try GitObject(encoded: GitZlib.decompress(compressed, limit: maximumObjectBytes + 128, checkingCancellation: !ignoresTransactionCancellation))
         guard object.body.count <= maximumObjectBytes else { throw GitError.sizeLimitExceeded(maximumObjectBytes) }
         guard try object.validatedID(using: hashAlgorithm) == id else { throw GitError.objectHashMismatch }
         return object
@@ -169,21 +179,10 @@ public actor GitRepository {
     }
 
     private static func parseConfiguration(_ text: String) throws -> GitHashAlgorithm {
-        var section = ""
         var values = [String: String]()
-        for line in text.split(whereSeparator: \.isNewline) {
-            let line = line.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix(";") { continue }
-            if line.hasPrefix("[") {
-                guard line.hasSuffix("]") else { throw GitError.unsupportedFeature("complex config syntax") }
-                section = String(line.dropFirst().dropLast()).lowercased()
-                if section.hasPrefix("include") { throw GitError.unsupportedFeature("config includes") }
-                continue
-            }
-            let pieces = line.split(separator: "=", maxSplits: 1)
-            let key = pieces[0].trimmingCharacters(in: .whitespaces).lowercased()
-            let value = pieces.count == 2 ? pieces[1].trimmingCharacters(in: .whitespaces) : "true"
-            values["\(section).\(key)"] = value
+        for entry in try GitConfiguration(text).entries {
+            if entry.section.hasPrefix("include") { throw GitError.unsupportedFeature("config includes") }
+            if entry.subsection == nil { values["\(entry.section).\(entry.key)"] = entry.value }
         }
         guard let version = values["core.repositoryformatversion"], version == "0" || version == "1" else {
             throw GitError.unsupportedFeature("repository format version")

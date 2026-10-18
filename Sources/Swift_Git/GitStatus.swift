@@ -8,7 +8,7 @@
 import Foundation
 
 public enum GitChangeKind: String, Sendable {
-    case added, modified, deleted, typeChanged, untracked
+    case added, modified, deleted, typeChanged, untracked, conflicted
 }
 
 public struct GitFileStatus: Identifiable, Sendable, Equatable {
@@ -36,10 +36,13 @@ extension GitRepository {
         let state = try headState()
         let headFiles = try headFiles(state.id)
         let entries = try indexEntries()
-        let index = Dictionary(uniqueKeysWithValues: entries.map { ($0.path, $0) })
-        let work = try workingTree(tracked: entries)
+        let conflicts = Set(entries.filter { $0.stage > 0 }.map(\.path))
+        let baseline = workingIndex(entries)
+        let index = Dictionary(uniqueKeysWithValues: baseline.map { ($0.path, $0) })
+        let work = try workingTree(tracked: baseline)
         let paths = Set(headFiles.keys).union(index.keys).union(work.keys).sorted()
         let files = paths.compactMap { path -> GitFileStatus? in
+            if conflicts.contains(path) { return .init(path: path, staged: .conflicted, unstaged: .conflicted) }
             let staged = Self.change(from: headFiles[path], to: index[path])
             let unstaged = Self.change(from: index[path], to: work[path], untracked: index[path] == nil)
             guard staged != nil || unstaged != nil else { return nil }
@@ -53,31 +56,34 @@ extension GitRepository {
         for path in paths { try GitIndex.validatePath(path) }
         let lock = try GitFileLock(metadataURL("index"))
         let entries = try indexEntries()
-        var index = Dictionary(uniqueKeysWithValues: entries.map { ($0.path, $0) })
+        var index = Dictionary(uniqueKeysWithValues: entries.filter { $0.stage == 0 }.map { ($0.path, $0) })
         let selected = Set(paths)
-        let work = try workingTree(tracked: entries, storing: selected)
+        let work = try workingTree(tracked: workingIndex(entries), storing: selected)
         for path in selected {
-            guard index[path] != nil || work[path] != nil else { throw GitError.unsafeCheckoutPath(path) }
+            guard entries.contains(where: { $0.path == path }) || work[path] != nil else { throw GitError.unsafeCheckoutPath(path) }
             index[path] = work[path]
         }
-        try validateIndexPaths(Array(index.values))
-        try lock.publish(GitIndex.encode(Array(index.values), algorithm: hashAlgorithm))
+        let combined = Array(index.values) + entries.filter { $0.stage > 0 && !selected.contains($0.path) }
+        try validateIndexPaths(combined)
+        try lock.publish(GitIndex.encode(combined, algorithm: hashAlgorithm))
     }
 
     public func unstage(paths: [String]) throws {
         for path in paths { try GitIndex.validatePath(path) }
         let lock = try GitFileLock(metadataURL("index"))
-        var index = Dictionary(uniqueKeysWithValues: try indexEntries().map { ($0.path, $0) })
+        let entries = try indexEntries()
+        var index = Dictionary(uniqueKeysWithValues: entries.filter { $0.stage == 0 }.map { ($0.path, $0) })
         let original = try headFiles(headState().id)
         for path in Set(paths) { index[path] = original[path] }
-        try validateIndexPaths(Array(index.values))
-        try lock.publish(GitIndex.encode(Array(index.values), algorithm: hashAlgorithm))
+        let combined = Array(index.values) + entries.filter { $0.stage > 0 && !paths.contains($0.path) }
+        try validateIndexPaths(combined)
+        try lock.publish(GitIndex.encode(combined, algorithm: hashAlgorithm))
     }
 
     /// A before/after pair from HEAD→index or index→working tree.
     public func comparison(path: String, staged: Bool) throws -> GitFileComparison {
         try GitIndex.validatePath(path)
-        let index = try indexEntries().first { $0.path == path }
+        let index = workingIndex(try indexEntries()).first { $0.path == path }
         let before = staged ? try headFiles(headState().id)[path] : index
         func bytes(_ entry: GitIndexEntry?) throws -> Data? {
             guard let entry else { return nil }
@@ -126,7 +132,10 @@ extension GitRepository {
     func validateIndexPaths(_ entries: [GitIndexEntry]) throws {
         let paths = Set(entries.map(\.path))
         var normalized = Set<String>()
-        for entry in entries {
+        for (_, group) in Dictionary(grouping: entries, by: \.path) {
+            let stages = group.map(\.stage)
+            guard Set(stages).count == stages.count, stages.count == 1 || !stages.contains(0) else { throw GitError.malformedObject("index stages") }
+            let entry = group[0]
             try GitIndex.validatePath(entry.path)
             let key = entry.path.precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
             guard normalized.insert(key).inserted else { throw GitError.unsafeCheckoutPath(entry.path) }
@@ -136,6 +145,17 @@ extension GitRepository {
                 guard !paths.contains(parts.joined(separator: "/")) else { throw GitError.unsafeCheckoutPath(entry.path) }
             }
         }
+    }
+
+    func workingIndex(_ entries: [GitIndexEntry]) -> [GitIndexEntry] {
+        let groups = Dictionary(grouping: entries, by: \.path)
+        var result = [GitIndexEntry]()
+        for group in groups.values {
+            for stage in [0, 2, 3, 1] {
+                if let entry = group.first(where: { $0.stage == stage }) { result.append(entry); break }
+            }
+        }
+        return result
     }
 
     private static func change(from old: GitIndexEntry?, to new: GitIndexEntry?, untracked: Bool = false) -> GitChangeKind? {

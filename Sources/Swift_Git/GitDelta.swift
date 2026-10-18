@@ -8,7 +8,7 @@
 import Foundation
 
 enum GitDelta {
-    static func apply(_ delta: Data, to base: Data, limit: Int) throws -> Data {
+    static func apply(_ delta: Data, to base: Data, limit: Int, checkingCancellation: Bool = true) throws -> Data {
         var reader = GitByteReader(delta)
         let baseSize = try size(&reader)
         let resultSize = try size(&reader)
@@ -17,7 +17,7 @@ enum GitDelta {
         var result = Data()
         result.reserveCapacity(resultSize)
         while !reader.isAtEnd {
-            try Task.checkCancellation()
+            if checkingCancellation { try Task.checkCancellation() }
             let opcode = try byte(&reader)
             if opcode & 0x80 == 0 {
                 guard opcode != 0 else { throw GitError.malformedObject("zero delta instruction") }

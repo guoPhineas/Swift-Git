@@ -13,6 +13,11 @@ struct GitIndexEntry: Sendable, Equatable {
     let mode: GitFileMode
     let id: GitObjectID
     let size: Int
+    let stage: Int
+
+    init(path: String, mode: GitFileMode, id: GitObjectID, size: Int, stage: Int = 0) {
+        self.path = path; self.mode = mode; self.id = id; self.size = size; self.stage = stage
+    }
 
     func matches(_ other: Self?) -> Bool { other?.mode == mode && other?.id == id }
 }
@@ -42,7 +47,8 @@ enum GitIndex {
             let size = Int(try reader.networkUInt32())
             let id = try GitObjectID(bytes: Array(reader.read(count: algorithm.byteCount)), algorithm: algorithm)
             let flags = try reader.read(count: 2).reduce(0) { $0 << 8 | Int($1) }
-            guard flags & 0x7000 == 0 else { throw GitError.unsupportedFeature("conflicted or extended index entries") }
+            guard flags & 0x4000 == 0 else { throw GitError.unsupportedFeature("extended index entries") }
+            let stage = (flags >> 12) & 3
             guard let path = String(data: try reader.read(until: 0), encoding: .utf8) else {
                 throw GitError.unsupportedFeature("non-UTF-8 index path")
             }
@@ -50,10 +56,12 @@ enum GitIndex {
             guard flags & 0xFFF == min(path.utf8.count, 0xFFF) else { throw GitError.malformedObject("index name length") }
             let padding = (8 - (reader.offset - start) % 8) % 8
             guard try reader.read(count: padding).allSatisfy({ $0 == 0 }) else { throw GitError.malformedObject("index padding") }
-            if let previous = entries.last, !Data(previous.path.utf8).lexicographicallyPrecedes(Data(path.utf8)) {
-                throw GitError.malformedObject("unsorted or duplicate index path")
+            if let previous = entries.last {
+                guard Data(previous.path.utf8).lexicographicallyPrecedes(Data(path.utf8)) || (previous.path == path && previous.stage < stage) else {
+                    throw GitError.malformedObject("unsorted or duplicate index path")
+                }
             }
-            entries.append(.init(path: path, mode: mode, id: id, size: size))
+            entries.append(.init(path: path, mode: mode, id: id, size: size, stage: stage))
         }
         while !reader.isAtEnd {
             let signature = try reader.read(count: 4)
@@ -70,7 +78,7 @@ enum GitIndex {
         var data = Data("DIRC".utf8)
         data.appendNetwork(2)
         data.appendNetwork(UInt32(entries.count))
-        for entry in entries.sorted(by: { Data($0.path.utf8).lexicographicallyPrecedes(Data($1.path.utf8)) }) {
+        for entry in entries.sorted(by: { $0.path == $1.path ? $0.stage < $1.stage : Data($0.path.utf8).lexicographicallyPrecedes(Data($1.path.utf8)) }) {
             try Task.checkCancellation()
             try validatePath(entry.path)
             let start = data.count
@@ -81,7 +89,8 @@ enum GitIndex {
             data.appendNetwork(0)
             data.appendNetwork(UInt32(truncatingIfNeeded: entry.size))
             data.append(contentsOf: entry.id.bytes)
-            let length = min(entry.path.utf8.count, 0xFFF)
+            guard (0...3).contains(entry.stage) else { throw GitError.malformedObject("index stage") }
+            let length = min(entry.path.utf8.count, 0xFFF) | (entry.stage << 12)
             data.append(UInt8(length >> 8))
             data.append(UInt8(length & 255))
             data.append(contentsOf: entry.path.utf8)
@@ -116,6 +125,7 @@ final class GitFileLock {
     private let lockURL: URL
     private let file: FileHandle
     private var published = false
+    let identity: GitLockIdentity
 
     init(_ destination: URL) throws {
         self.destination = destination
@@ -126,10 +136,13 @@ final class GitFileLock {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        identity = .init(path: lockURL.path, inode: UInt64(info.st_ino), device: Int64(info.st_dev))
     }
 
-    func publish(_ data: Data) throws {
-        try Task.checkCancellation()
+    func publish(_ data: Data, checkingCancellation: Bool = true) throws {
+        if checkingCancellation { try Task.checkCancellation() }
         try file.write(contentsOf: data)
         try file.synchronize()
         guard rename(lockURL.path, destination.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -140,4 +153,10 @@ final class GitFileLock {
         try? file.close()
         if !published { try? FileManager.default.removeItem(at: lockURL) }
     }
+}
+
+struct GitLockIdentity: Codable {
+    let path: String
+    let inode: UInt64
+    let device: Int64
 }

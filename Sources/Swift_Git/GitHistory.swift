@@ -57,7 +57,9 @@ extension GitRepository {
     public func log(limit: Int = 200) throws -> [GitCommit] {
         guard limit > 0, limit <= 10_000 else { throw GitError.resourceLimitExceeded("history page", 10_000) }
         guard let id = try headState().id else { return [] }
-        var frontier = [try commitObject(id)]
+        let first = try commitObject(id)
+        var frontier = GitCommitHeap()
+        frontier.push(first)
         var seen: Set<GitObjectID> = [id]
         var result = [GitCommit]()
         var retainedBytes = 0
@@ -66,20 +68,36 @@ extension GitRepository {
                 + commit.parents.count * (hashAlgorithm.byteCount + 32) + 256
             guard retainedBytes <= 32 * 1_024 * 1_024 else { throw GitError.sizeLimitExceeded(32 * 1_024 * 1_024) }
         }
-        try account(frontier[0])
+        try account(first)
         while !frontier.isEmpty, result.count < limit {
             try Task.checkCancellation()
-            let index = frontier.indices.max { frontier[$0].date < frontier[$1].date }!
-            let commit = frontier.remove(at: index)
+            let commit = frontier.pop()!
             result.append(commit)
             for parent in commit.parents where seen.insert(parent).inserted {
                 guard seen.count <= 50_000 else { throw GitError.resourceLimitExceeded("history frontier", 50_000) }
                 let next = try commitObject(parent)
                 try account(next)
-                frontier.append(next)
+                frontier.push(next)
             }
         }
-        return result
+        // Date skew must never place a parent above its child in the graph.
+        let byID = Dictionary(uniqueKeysWithValues: result.map { ($0.id, $0) })
+        var children = [GitObjectID: Int]()
+        for commit in result {
+            for parent in commit.parents where byID[parent] != nil { children[parent, default: 0] += 1 }
+        }
+        var ready = GitCommitHeap()
+        for commit in result where children[commit.id, default: 0] == 0 { ready.push(commit) }
+        var ordered = [GitCommit]()
+        while let commit = ready.pop() {
+            ordered.append(commit)
+            for parent in commit.parents where byID[parent] != nil {
+                children[parent, default: 0] -= 1
+                if children[parent] == 0 { ready.push(byID[parent]!) }
+            }
+        }
+        guard ordered.count == result.count else { throw GitError.malformedObject("cyclic commit graph") }
+        return ordered
     }
 
     func commitObject(_ id: GitObjectID) throws -> GitCommit { try GitCommit(id: id, object: readObject(id)) }
@@ -100,7 +118,7 @@ extension GitRepository {
         return try .init(text: text, reference: nil, id: GitObjectID(hex: text, algorithm: hashAlgorithm))
     }
 
-    private func resolveReference(_ reference: String, depth: Int = 0) throws -> GitObjectID? {
+    func resolveReference(_ reference: String, depth: Int = 0) throws -> GitObjectID? {
         guard depth < 5 else { throw GitError.malformedObject("reference cycle") }
         _ = try GitReferenceName(reference)
         if let value = try optionalMetadata(reference, limit: 4096) {
@@ -140,5 +158,36 @@ extension GitRepository {
     func metadataText(_ path: String) throws -> String {
         String(decoding: try Self.readFile(metadataURL(path), limit: 4096), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+private struct GitCommitHeap {
+    private var values = [GitCommit]()
+    var isEmpty: Bool { values.isEmpty }
+    private func before(_ lhs: GitCommit, _ rhs: GitCommit) -> Bool {
+        lhs.date == rhs.date ? lhs.id.bytes.lexicographicallyPrecedes(rhs.id.bytes) : lhs.date > rhs.date
+    }
+    mutating func push(_ value: GitCommit) {
+        values.append(value)
+        var index = values.count - 1
+        while index > 0 {
+            let parent = (index - 1) / 2
+            guard before(values[index], values[parent]) else { break }
+            values.swapAt(index, parent); index = parent
+        }
+    }
+    mutating func pop() -> GitCommit? {
+        guard !values.isEmpty else { return nil }
+        if values.count == 1 { return values.removeLast() }
+        let result = values[0]
+        values[0] = values.removeLast()
+        var index = 0
+        while index * 2 + 1 < values.count {
+            var child = index * 2 + 1
+            if child + 1 < values.count, before(values[child + 1], values[child]) { child += 1 }
+            guard before(values[child], values[index]) else { break }
+            values.swapAt(child, index); index = child
+        }
+        return result
     }
 }

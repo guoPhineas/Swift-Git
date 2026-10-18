@@ -6,21 +6,28 @@
 //
 
 import Foundation
+import Darwin
 
 /// A task-owned, buffered reader; never shared across concurrent tasks.
 final class GitFileReader {
     private let file: FileHandle
     let size: Int
+    let checksCancellation: Bool
     private(set) var offset = 0
     private var buffer = Data()
     private var bufferStart = 0
     private var index = 0
 
-    init(_ url: URL, limit: Int) throws {
-        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? Int.max
-        guard size >= 0, size <= limit else { throw GitError.sizeLimitExceeded(limit) }
-        self.size = size
-        file = try FileHandle(forReadingFrom: url)
+    init(_ url: URL, limit: Int, checksCancellation: Bool = true) throws {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw GitError.malformedObject("expected regular pack file") }
+        guard info.st_size >= 0, info.st_size <= limit else { throw GitError.sizeLimitExceeded(limit) }
+        size = Int(info.st_size)
+        file = handle
+        self.checksCancellation = checksCancellation
     }
 
     deinit { try? file.close() }
@@ -40,7 +47,7 @@ final class GitFileReader {
 
     func peek() throws -> Data {
         if index == buffer.count {
-            try Task.checkCancellation()
+            if checksCancellation { try Task.checkCancellation() }
             try file.seek(toOffset: UInt64(offset))
             buffer = try file.read(upToCount: 65_536) ?? Data()
             bufferStart = offset

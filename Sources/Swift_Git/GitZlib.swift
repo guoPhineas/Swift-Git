@@ -19,7 +19,7 @@ enum GitZlib {
         var output = Data()
         var chunk = [UInt8](repeating: 0, count: 16_384)
         while true {
-            try Task.checkCancellation()
+            if reader.checksCancellation { try Task.checkCancellation() }
             let input = try reader.peek()
             guard !input.isEmpty else { throw GitError.truncatedInput }
             let result: (status: Int32, consumed: Int) = try input.withUnsafeBytes { source in
@@ -28,7 +28,7 @@ enum GitZlib {
                 defer { stream.next_in = nil; stream.next_out = nil }
                 var status: Int32 = Z_OK
                 repeat {
-                    try Task.checkCancellation()
+                    if reader.checksCancellation { try Task.checkCancellation() }
                     let written = chunk.withUnsafeMutableBytes { destination in
                         stream.next_out = destination.bindMemory(to: Bytef.self).baseAddress
                         stream.avail_out = uInt(destination.count)
@@ -65,7 +65,7 @@ enum GitZlib {
         return output
     }
 
-    static func decompress(_ input: Data, limit: Int) throws -> Data {
+    static func decompress(_ input: Data, limit: Int, checkingCancellation: Bool = true) throws -> Data {
         guard limit >= 0 else { throw GitError.sizeLimitExceeded(limit) }
         guard input.count <= Int(UInt32.max) else { throw GitError.sizeLimitExceeded(Int(UInt32.max)) }
         var stream = z_stream()
@@ -80,7 +80,7 @@ enum GitZlib {
             var output = Data()
             var chunk = [UInt8](repeating: 0, count: 16_384)
             while true {
-                try Task.checkCancellation()
+                if checkingCancellation { try Task.checkCancellation() }
                 let (status, written) = chunk.withUnsafeMutableBytes { buffer -> (Int32, Int) in
                     stream.next_out = buffer.bindMemory(to: Bytef.self).baseAddress
                     stream.avail_out = uInt(buffer.count)

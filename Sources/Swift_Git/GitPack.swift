@@ -28,7 +28,7 @@ enum GitPack {
 
     @concurrent
     static func unpack(_ url: URL, into repository: GitRepository, options: GitCloneOptions,
-                       progress: GitCloneProgressHandler?) async throws -> Set<GitObjectID> {
+                       progress: GitCloneProgressHandler?, allowExisting: Bool = false, persist: Bool = false) async throws -> Set<GitObjectID> {
         let algorithm = repository.hashAlgorithm
         let reader = try GitFileReader(url, limit: options.maximumDownloadBytes)
         guard reader.size >= 12 + algorithm.byteCount else { throw GitError.truncatedInput }
@@ -58,7 +58,7 @@ enum GitPack {
                     throw GitError.malformedObject("conflicting referenced object types")
                 }
                 references[link.id] = link.kind
-                guard references.count <= count else { throw GitError.malformedObject("too many missing referenced objects") }
+                guard references.count <= (allowExisting ? options.maximumObjects : count) else { throw GitError.malformedObject("too many missing referenced objects") }
             }
             let id = try await repository.writeObject(object)
             let resolved = Resolved(id: id, depth: depth, kind: object.kind)
@@ -123,7 +123,10 @@ enum GitPack {
                 let base: Resolved?
                 switch entry.base {
                 case .offset(let offset): base = resolvedByOffset[offset]
-                case .id(let id): base = resolvedByID[id]
+                case .id(let id):
+                    if let resolved = resolvedByID[id] { base = resolved }
+                    else if allowExisting, let object = try? await repository.readObject(id) { base = .init(id: id, depth: 0, kind: object.kind) }
+                    else { base = nil }
                 }
                 guard let base else { unresolved.append(entry); continue }
                 guard base.depth < options.maximumDeltaDepth else { throw GitError.resourceLimitExceeded("delta depth", options.maximumDeltaDepth) }
@@ -138,7 +141,12 @@ enum GitPack {
         }
         let ids = Set(resolvedByID.keys)
         for (id, kind) in references {
-            guard resolvedByID[id]?.kind == kind else { throw GitError.malformedObject("missing or mistyped referenced object") }
+            if resolvedByID[id]?.kind == kind { continue }
+            guard allowExisting, try await repository.readObject(id).kind == kind else { throw GitError.malformedObject("missing or mistyped referenced object") }
+        }
+        if persist {
+            try GitPackInstaller.install(url, entries: resolvedByOffset.map { (id: $0.value.id, offset: $0.key) },
+                                         in: repository.workingDirectory, algorithm: algorithm)
         }
         return ids
     }

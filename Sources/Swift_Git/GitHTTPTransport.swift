@@ -11,15 +11,24 @@ import Synchronization
 protocol GitHTTPTransport: Sendable {
     func discover(_ url: URL) async throws -> Data
     func fetch(_ url: URL, request: Data, to file: URL, limit: Int, progress: GitCloneProgressHandler?) async throws
+    func send(_ url: URL, requestFile: URL, limit: Int) async throws -> Data
+}
+
+extension GitHTTPTransport {
+    func send(_ url: URL, requestFile: URL, limit: Int) async throws -> Data { throw GitError.unsupportedFeature("receive-pack transport") }
 }
 
 struct GitURLSessionTransport: GitHTTPTransport {
+    var credential: GitHTTPCredential?
     func discover(_ url: URL) async throws -> Data {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: file) }
         var request = URLRequest(url: url)
-        request.setValue("application/x-git-upload-pack-advertisement", forHTTPHeaderField: "Accept")
-        try await download(request, to: file, limit: 4 * 1_024 * 1_024, mime: "application/x-git-upload-pack-advertisement", progress: nil)
+        let service = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "service" }?.value ?? "git-upload-pack"
+        guard ["git-upload-pack", "git-receive-pack"].contains(service) else { throw GitError.invalidProtocol("service") }
+        if service == "git-upload-pack" { request.setValue("version=2", forHTTPHeaderField: "Git-Protocol") }
+        request.setValue("application/x-\(service)-advertisement", forHTTPHeaderField: "Accept")
+        try await download(request, to: file, limit: 4 * 1_024 * 1_024, mime: "application/x-\(service)-advertisement", progress: nil)
         return try Data(contentsOf: file)
     }
 
@@ -27,13 +36,28 @@ struct GitURLSessionTransport: GitHTTPTransport {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = body
+        if body.dropFirst(4).starts(with: Data("command=".utf8)) { request.setValue("version=2", forHTTPHeaderField: "Git-Protocol") }
         request.setValue("application/x-git-upload-pack-request", forHTTPHeaderField: "Content-Type")
         request.setValue("application/x-git-upload-pack-result", forHTTPHeaderField: "Accept")
         try await download(request, to: file, limit: limit, mime: "application/x-git-upload-pack-result", progress: progress)
     }
 
-    private func download(_ request: URLRequest, to file: URL, limit: Int, mime: String,
+    func send(_ url: URL, requestFile: URL, limit: Int) async throws -> Data {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: destination) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = try GitRepository.readFile(requestFile, limit: limit)
+        request.setValue("application/x-git-receive-pack-request", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/x-git-receive-pack-result", forHTTPHeaderField: "Accept")
+        try await download(request, to: destination, limit: 1_024 * 1_024, mime: "application/x-git-receive-pack-result", progress: nil)
+        return try Data(contentsOf: destination)
+    }
+
+    private func download(_ original: URLRequest, to file: URL, limit: Int, mime: String,
                           progress: GitCloneProgressHandler?) async throws {
+        var request = original
+        if let credential { request.setValue(credential.authorization, forHTTPHeaderField: "Authorization") }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 60
         configuration.timeoutIntervalForResource = 600
@@ -89,6 +113,12 @@ private final class GitDownloadDelegate: NSObject, URLSessionDownloadDelegate, S
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         guard request.url?.scheme?.lowercased() == "https", request.url?.user == nil, request.url?.password == nil else {
+            failure.withLock { $0 = .invalidRemoteURL }
+            completionHandler(nil)
+            return
+        }
+        if let original = task.originalRequest, original.value(forHTTPHeaderField: "Authorization") != nil,
+           (original.url?.host?.lowercased() != request.url?.host?.lowercased() || original.url?.port != request.url?.port) {
             failure.withLock { $0 = .invalidRemoteURL }
             completionHandler(nil)
             return

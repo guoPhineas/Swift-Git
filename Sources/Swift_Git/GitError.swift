@@ -28,11 +28,19 @@ public enum GitError: Error, Sendable, Equatable {
     case repositoryBusy
     case nothingToCommit
     case invalidIdentity
+    case nonFastForward
+    case dirtyWorktree
+    case recoveryRequired
+    case unresolvedConflicts
 }
 
 extension GitError: LocalizedError {
     public var errorDescription: String? {
         switch self {
+        case .unresolvedConflicts: "Resolve and stage every conflicted file before continuing."
+        case .recoveryRequired: "An interrupted Git transaction needs recovery. Reopen the repository; externally changed files will be preserved."
+        case .nonFastForward: "The remote contains commits missing from this branch. Fetch and merge before pushing."
+        case .dirtyWorktree: "Save, commit, or discard working tree changes before switching or merging branches."
         case .repositoryBusy: "Another Git operation is in progress. Wait for it to finish and retry."
         case .nothingToCommit: "There are no staged changes to commit."
         case .invalidIdentity: "Enter a valid author name and email address."

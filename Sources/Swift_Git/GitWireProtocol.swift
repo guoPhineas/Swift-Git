@@ -8,6 +8,7 @@
 import Foundation
 
 enum GitPacket {
+    enum Frame { case data(Data), flush, delimiter, responseEnd }
     static func encode(_ payload: Data) throws -> Data {
         guard payload.count <= 65_516 else { throw GitError.invalidProtocol("packet too large") }
         var packet = Data(String(format: "%04x", payload.count + 4).utf8)
@@ -16,24 +17,36 @@ enum GitPacket {
     }
 
     static func read(from reader: GitFileReader) throws -> Data? {
+        switch try frame(from: reader) {
+        case .data(let data): return data
+        case .flush: return nil
+        default: throw GitError.invalidProtocol("unexpected control packet")
+        }
+    }
+
+    static func frame(from reader: GitFileReader) throws -> Frame {
         let header = try reader.read(4)
         guard header.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) || (65...70).contains($0) }),
               let size = Int(String(decoding: header, as: UTF8.self), radix: 16) else {
             throw GitError.invalidProtocol("invalid packet length")
         }
-        if size == 0 { return nil }
+        if size == 0 { return .flush }
+        if size == 1 { return .delimiter }
+        if size == 2 { return .responseEnd }
         guard size >= 4, size <= 65_520 else { throw GitError.invalidProtocol("invalid packet length") }
-        return try reader.read(size - 4)
+        return try .data(reader.read(size - 4))
     }
 }
 
 struct GitAdvertisement {
+    var wireVersion = 1
+    var v2Features: Set<String> = []
     let algorithm: GitHashAlgorithm
     let references: [String: GitObjectID]
     let capabilities: Set<String>
     let headTarget: String?
 
-    init(_ data: Data) throws {
+    init(_ data: Data, service: String = "git-upload-pack") throws {
         var reader = GitByteReader(data)
         func packet() throws -> Data? {
             let header = try reader.read(count: 4)
@@ -45,7 +58,7 @@ struct GitAdvertisement {
             guard length >= 4, length <= 65_520 else { throw GitError.invalidProtocol("advertisement packet length") }
             return try reader.read(count: length - 4)
         }
-        guard try packet() == Data("# service=git-upload-pack\n".utf8), try packet() == nil else {
+        guard try packet() == Data("# service=\(service)\n".utf8), try packet() == nil else {
             throw GitError.invalidProtocol("missing upload-pack service")
         }
         var refs = [String: GitObjectID]()
@@ -108,8 +121,17 @@ struct GitAdvertisement {
         return (matching.first(where: { $0 == "refs/heads/main" }) ?? matching.first).map { String($0.dropFirst(11)) }
     }
 
-    func fetchRequest() throws -> Data {
+    func fetchRequest(haves: [GitObjectID] = []) throws -> Data {
         let wants = Set(wantedReferences.values).sorted { $0.hex < $1.hex }
+        if wireVersion == 2 {
+            var data = try GitV2Discovery.command("fetch", algorithm: algorithm)
+            for want in wants { data.append(try GitPacket.encode(Data("want \(want.hex)\n".utf8))) }
+            for have in haves { data.append(try GitPacket.encode(Data("have \(have.hex)\n".utf8))) }
+            data.append(try GitPacket.encode(Data("ofs-delta\n".utf8)))
+            data.append(try GitPacket.encode(Data("done\n".utf8)))
+            data.append(Data("0000".utf8))
+            return data
+        }
         var selected = [String]()
         guard capabilities.contains("side-band-64k") || capabilities.contains("side-band") else {
             throw GitError.unsupportedFeature("Git server without side-band support")
@@ -123,6 +145,7 @@ struct GitAdvertisement {
             data.append(try GitPacket.encode(Data("want \(want.hex)\(suffix)\n".utf8)))
         }
         data.append(Data("0000".utf8))
+        for have in haves { data.append(try GitPacket.encode(Data("have \(have.hex)\n".utf8))) }
         data.append(try GitPacket.encode(Data("done\n".utf8)))
         return data
     }
@@ -139,13 +162,21 @@ enum GitUploadPackResponse {
         var packBytes = 0
         while reader.offset < reader.size {
             try Task.checkCancellation()
-            guard let packet = try GitPacket.read(from: reader) else {
+            let frame = try GitPacket.frame(from: reader)
+            let packet: Data
+            switch frame {
+            case .data(let data): packet = data
+            case .flush:
+                if reader.offset < reader.size {
+                    guard case .responseEnd = try GitPacket.frame(from: reader) else { throw GitError.invalidProtocol("data after final flush") }
+                }
                 guard reader.offset == reader.size else { throw GitError.invalidProtocol("data after final flush") }
                 terminated = true
-                break
+                continue
+            default: throw GitError.invalidProtocol("unexpected pack section")
             }
             if !receivedNAK {
-                guard packet == Data("NAK\n".utf8) else { throw GitError.invalidProtocol("expected initial NAK") }
+                guard packet == Data("NAK\n".utf8) || packet == Data("packfile\n".utf8) || packet.starts(with: Data("ACK ".utf8)) else { throw GitError.invalidProtocol("expected ACK or packfile") }
                 receivedNAK = true
                 continue
             }

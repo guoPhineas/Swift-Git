@@ -73,7 +73,10 @@ extension GitRepository {
         let parts = path.split(separator: "/")
         for component in parts.dropLast() {
             url.appendPathComponent(String(component))
-            do { try Self.requireDirectory(url) }
+            do {
+                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                if values.isDirectory != true || values.isSymbolicLink == true { return nil }
+            }
             catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
         }
         url.appendPathComponent(String(parts.last!))

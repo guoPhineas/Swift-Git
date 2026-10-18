@@ -23,6 +23,7 @@ public struct GitRemoteURL: Sendable, Equatable {
 }
 
 public struct GitCloneOptions: Sendable {
+    public var credential: GitHTTPCredential?
     public var maximumDownloadBytes = 128 * 1_024 * 1_024
     public var maximumObjectBytes = 64 * 1_024 * 1_024
     public var maximumExpandedBytes = 512 * 1_024 * 1_024

@@ -30,7 +30,7 @@ extension GitRepository {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !message.utf8.contains(0) else {
             throw GitError.malformedObject("empty or invalid commit message")
         }
-        for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] {
+        for marker in ["CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] {
             if FileManager.default.fileExists(atPath: gitDirectory.appendingPathComponent(marker).path) {
                 throw GitError.unsupportedFeature("commit during merge, cherry-pick, revert, or rebase")
             }
@@ -47,8 +47,12 @@ extension GitRepository {
             targetLock = try GitFileLock(metadataURL(reference, createParents: true))
         } else { targetLock = headLock }
         let entries = try indexEntries()
+        guard entries.allSatisfy({ $0.stage == 0 }) else { throw GitError.unresolvedConflicts }
+        let mergeParents = try optionalMetadata("MERGE_HEAD", limit: 4096).map {
+            try String(decoding: $0, as: UTF8.self).split(whereSeparator: \.isWhitespace).map { try GitObjectID(hex: String($0), algorithm: hashAlgorithm) }
+        } ?? []
         let tree = try writeTree(entries, base: "", depth: 0)
-        if let old = state.id, try commitObject(old).tree == tree { throw GitError.nothingToCommit }
+        if mergeParents.isEmpty, let old = state.id, try commitObject(old).tree == tree { throw GitError.nothingToCommit }
         guard state.id != nil || !entries.isEmpty else { throw GitError.nothingToCommit }
         let timestamp = date.timeIntervalSince1970
         guard timestamp.isFinite, timestamp >= 0, timestamp < Double(Int64.max) else {
@@ -57,16 +61,32 @@ extension GitRepository {
         let identity = "\(author.name) <\(author.email)> \(Int64(timestamp)) +0000"
         var body = "tree \(tree.hex)\n"
         if let parent = state.id { body += "parent \(parent.hex)\n" }
+        for parent in mergeParents { _ = try commitObject(parent); body += "parent \(parent.hex)\n" }
         body += "author \(identity)\ncommitter \(identity)\n\n" + message
         if !body.hasSuffix("\n") { body += "\n" }
         let id = try writeObject(.init(kind: .commit, body: Data(body.utf8)))
         guard try headState() == state else { throw GitError.repositoryBusy }
-        // This is the publication point. No fallible work follows it.
-        try targetLock.publish(Data("\(id.hex)\n".utf8))
+        let target = state.reference ?? "HEAD"
+        var changes = [GitMetadataChange(path: target, value: Data("\(id.hex)\n".utf8))]
+        let zero = String(repeating: "0", count: hashAlgorithm.byteCount * 2)
+        let entry = "\(state.id?.hex ?? zero) \(id.hex) \(identity)\tcommit: \(message.split(separator: "\n").first ?? "")\n"
+        for path in Set(["logs/HEAD", state.reference.map { "logs/" + $0 }].compactMap { $0 }) {
+            var log = try optionalMetadata(path, limit: 8 * 1_024 * 1_024) ?? Data()
+            log.append(Data(entry.utf8))
+            changes.append(.init(path: path, value: log))
+        }
+        if !mergeParents.isEmpty {
+            changes += [.init(path: "MERGE_HEAD", value: nil), .init(path: "MERGE_MSG", value: nil), .init(path: "mobgit-merge.json", value: nil)]
+        }
+        var holding = ["index": indexLock, "HEAD": headLock]
+        holding[target] = targetLock
+        try metadataTransaction(changes, holding: holding) {
+            guard try headState() == state, try indexEntries() == entries else { throw GitError.repositoryBusy }
+        }
         return id
     }
 
-    private func writeTree(_ entries: [GitIndexEntry], base: String, depth: Int) throws -> GitObjectID {
+    func writeTree(_ entries: [GitIndexEntry], base: String, depth: Int) throws -> GitObjectID {
         guard depth <= 256 else { throw GitError.resourceLimitExceeded("tree depth", 256) }
         var files = [GitTreeEntry]()
         var directories = [String: [GitIndexEntry]]()

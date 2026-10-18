@@ -14,7 +14,7 @@ extension GitRepository {
     @concurrent
     public static func clone(from remote: GitRemoteURL, to destination: URL,
                              options: GitCloneOptions = .init(), progress: GitCloneProgressHandler? = nil) async throws -> GitRepository {
-        try await clone(from: remote, to: destination, options: options, transport: GitURLSessionTransport(), progress: progress)
+        try await clone(from: remote, to: destination, options: options, transport: GitURLSessionTransport(credential: options.credential), progress: progress)
     }
 
     @concurrent
@@ -28,7 +28,7 @@ extension GitRepository {
         var discovery = URLComponents(url: remote.url.appendingPathComponent("info/refs"), resolvingAgainstBaseURL: false)
         discovery?.queryItems = [URLQueryItem(name: "service", value: "git-upload-pack")]
         guard let discoveryURL = discovery?.url else { throw GitError.invalidRemoteURL }
-        let advertisement = try GitAdvertisement(await transport.discover(discoveryURL))
+        let advertisement = try await GitV2Discovery.discover(discoveryURL, remote: remote, transport: transport)
         try Task.checkCancellation()
         let parent = destination.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -45,7 +45,7 @@ extension GitRepository {
                                       to: response, limit: options.maximumDownloadBytes, progress: progress)
             try GitUploadPackResponse.extract(response, to: pack, limit: options.maximumDownloadBytes)
             progress?(.init(stage: .unpacking))
-            ids = try await GitPack.unpack(pack, into: repository, options: options, progress: progress)
+            ids = try await GitPack.unpack(pack, into: repository, options: options, progress: progress, persist: true)
             try FileManager.default.removeItem(at: response)
             try FileManager.default.removeItem(at: pack)
             guard Set(advertisement.wantedReferences.values).isSubset(of: ids) else {
@@ -60,6 +60,11 @@ extension GitRepository {
         let branch = advertisement.defaultBranch
         let head = branch.flatMap { advertisement.references["refs/heads/" + $0] } ?? advertisement.references["HEAD"]
         try await GitCheckout.populate(repository, commit: head, options: options, progress: progress)
+        // The validated pack/index now own these objects; avoid duplicate loose storage.
+        for id in ids {
+            let object = temporary.appendingPathComponent(".git/objects/\(id.hex.prefix(2))/\(id.hex.dropFirst(2))")
+            try FileManager.default.removeItem(at: object)
+        }
         try installReferences(advertisement, remote: remote, in: temporary)
         try Task.checkCancellation()
         // RENAME_EXCL avoids replacing a destination created by another task during the download.

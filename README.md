@@ -33,7 +33,7 @@ The library product is named `Swift-Git`; its Swift module is `Swift_Git`. For a
 
 ```swift
 dependencies: [
-    .package(path: "../Swift-Git")
+    .package(url: "https://github.com/guoPhineas/Swift-Git.git")
 ],
 targets: [
     .target(

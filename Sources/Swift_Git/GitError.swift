@@ -32,11 +32,13 @@ public enum GitError: Error, Sendable, Equatable {
     case dirtyWorktree
     case recoveryRequired
     case unresolvedConflicts
+    case commitStateChanged
 }
 
 extension GitError: LocalizedError {
     public var errorDescription: String? {
         switch self {
+        case .commitStateChanged: "The branch, staged files or pending merge changed. Refresh and review the commit again."
         case .unresolvedConflicts: "Resolve and stage every conflicted file before continuing."
         case .recoveryRequired: "An interrupted Git transaction needs recovery. Reopen the repository; externally changed files will be preserved."
         case .nonFastForward: "The remote contains commits missing from this branch. Fetch and merge before pushing."
@@ -49,14 +51,14 @@ extension GitError: LocalizedError {
         case .truncatedInput: "Git data ended unexpectedly."
         case .sizeLimitExceeded(let limit): "This operation exceeds its \(limit)-byte safety limit."
         case .compression(let status): "zlib failed with status \(status)."
-        case .objectNotFound(let id): "Object \(id.hex) is not available in the loose object store."
+        case .objectNotFound(let id): "Object \(id.hex) is not available in the repository."
         case .objectHashMismatch: "The object content does not match its ID."
         case .invalidReference(let name): "Invalid Git reference: \(name)"
         case .notRepository: "The directory is not a supported Git repository."
         case .repositoryAlreadyExists: "The repository destination is not empty."
         case .unsupportedFeature(let feature): "Not supported yet: \(feature)."
         case .resourceLimitExceeded(let resource, let limit): "The repository exceeds the \(resource) limit (\(limit))."
-        case .invalidRemoteURL: "Enter a public HTTPS repository URL without credentials, a query, or a fragment."
+        case .invalidRemoteURL: "Enter an HTTPS repository URL without embedded credentials, a query, or a fragment."
         case .httpStatus(let status): "The Git server returned HTTP \(status). The repository may be unavailable or require authentication."
         case .invalidProtocol(let reason): "Invalid Git server response: \(reason)"
         case .sha1Collision: "A SHA-1 collision was detected. The repository was rejected."

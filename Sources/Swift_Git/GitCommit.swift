@@ -26,15 +26,12 @@ public struct GitAuthor: Sendable {
 extension GitRepository {
     /// Commits the current index only. Files edited after staging remain unstaged.
     /// All writes are serialized by Git-compatible lock files; worktree files are untouched.
-    public func commit(message: String, author: GitAuthor, date: Date = .now) throws -> GitObjectID {
+    /// Pass the state from prepareCommit() to reject changes since the user's review.
+    public func commit(message: String, author: GitAuthor, date: Date = .now, expectedState: GitCommitState? = nil) throws -> GitObjectID {
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !message.utf8.contains(0) else {
             throw GitError.malformedObject("empty or invalid commit message")
         }
-        for marker in ["CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] {
-            if FileManager.default.fileExists(atPath: gitDirectory.appendingPathComponent(marker).path) {
-                throw GitError.unsupportedFeature("commit during merge, cherry-pick, revert, or rebase")
-            }
-        }
+        try validateCommitOperation()
         let indexLock = try GitFileLock(metadataURL("index"))
         let headLock = try GitFileLock(metadataURL("HEAD"))
         defer { withExtendedLifetime(indexLock) {}; withExtendedLifetime(headLock) {} }
@@ -46,6 +43,7 @@ extension GitRepository {
             }
             targetLock = try GitFileLock(metadataURL(reference, createParents: true))
         } else { targetLock = headLock }
+        if let expectedState, try captureCommitState() != expectedState { throw GitError.commitStateChanged }
         let entries = try indexEntries()
         guard entries.allSatisfy({ $0.stage == 0 }) else { throw GitError.unresolvedConflicts }
         let mergeParents = try optionalMetadata("MERGE_HEAD", limit: 4096).map {
@@ -82,6 +80,7 @@ extension GitRepository {
         holding[target] = targetLock
         try metadataTransaction(changes, holding: holding) {
             guard try headState() == state, try indexEntries() == entries else { throw GitError.repositoryBusy }
+            if let expectedState, try captureCommitState() != expectedState { throw GitError.commitStateChanged }
         }
         return id
     }

@@ -23,6 +23,8 @@ See [third-party notices](THIRD_PARTY.md).
   and symbolic link changes, exact-path stage/unstage and before/after comparisons.
 - Index v2/v3, including standard merge conflict stages 1/2/3.
 - Commit author/committer data, index tree generation, locked ref updates and reflogs.
+- Commit preparation with an opaque review snapshot; optional expected-state checks
+  reject index, branch or pending-merge changes while allowing unstaged file edits.
 - Branch listing/create/switch, tracking configuration, detached checkout, safe
   deletion of merged branches and lightweight tag creation.
 - Fast-forward and bounded three-way merge, merge-base lookup, text conflict markers,
@@ -48,6 +50,19 @@ let commit = try await repository.commit(
 )
 let history = try await repository.log(limit: 200)
 let changes = try await repository.changes(in: commit)
+```
+
+For a reviewable commit UI, use a snapshot rather than committing an unseen index:
+
+```swift
+let review = try await repository.prepareCommit()
+// Show review.status and review.suggestedMessage to the user.
+let reviewedCommit = try await repository.commit(
+    message: message,
+    author: author,
+    expectedState: review.state
+)
+// GitError.commitStateChanged requires refreshing and reviewing again.
 ```
 
 Authenticated network operations accept a caller-provided credential:
